@@ -1,295 +1,195 @@
 """
-Step 4: Word2Vec 기반 데이터 증강
-- ko.bin 모델을 사용하여 유사 문장 생성
-- 데이터를 3배로 증강
-- 증강된 데이터 저장
+Step 4: 코퍼스 기반 Word2Vec 학습 + Lexical Substitution 데이터 증강
+- ko.bin 없이 현재 데이터(질문+답변)로 Word2Vec 직접 학습
+- lexical_sub()로 각 토큰을 0.3 확률로 유사어 치환
+- 증강 구성: 원본 / 질문증강+원본답변 / 원본질문+답변증강 → 3배
 """
 
 import pandas as pd
 import numpy as np
 import os
 import sys
-from gensim.models import KeyedVectors
-from tqdm import tqdm
 import pickle
+from tqdm import tqdm
+from gensim.models import Word2Vec
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-class DataAugmenter:
-    """Word2Vec 기반 데이터 증강 클래스"""
-    
-    def __init__(self, ko_bin_path):
-        """
-        초기화
-        
-        Args:
-            ko_bin_path (str): ko.bin 모델 경로
-        """
-        self.ko_bin_path = ko_bin_path
-        self.word_vectors = None
-        self.load_model()
-    
-    def load_model(self):
-        """Word2Vec 모델 로드
 
-        - ko.bin 파일이 너무 크면 자동으로 스킵
-        - 로드 중 오류가 나도 예외를 전달하지 않고 None으로 설정
-        """
-        if not os.path.exists(self.ko_bin_path):
-            print(f"✗ Error: Model not found at {self.ko_bin_path}")
-            print("Please download ko.bin from:")
-            print("https://github.com/Kyubyong/wordvectors")
-            raise FileNotFoundError(f"ko.bin not found at {self.ko_bin_path}")
+def get_tokenizer():
+    """Okt 토크나이저 반환 (Mecab 실패 시 Okt, 그 다음 whitespace)"""
+    try:
+        from konlpy.tag import Mecab
+        tok = Mecab()
+        tok.morphs("테스트")
+        print("✓ Mecab 토크나이저 사용")
+        return tok
+    except Exception:
+        pass
+    try:
+        from konlpy.tag import Okt
+        tok = Okt()
+        print("✓ Okt 토크나이저 사용")
+        return tok
+    except Exception:
+        pass
+    print("⚠ whitespace 토크나이저 사용 (형태소 분석 불가)")
+    return None
 
-        size_bytes = os.path.getsize(self.ko_bin_path)
-        if size_bytes > 3_000_000_000:  # 3GB threshold
-            print(f"⚠️ ko.bin file is very large ({size_bytes/1e9:.1f}GB); skipping load to avoid potential hang")
-            self.word_vectors = None
-            return
 
-        print(f"Loading Word2Vec model from {self.ko_bin_path}...")
-        try:
-            # try several loading strategies to handle different ko.bin formats
-            load_attempted = False
+def tokenize(sentence, tokenizer):
+    """문장 → 형태소 리스트"""
+    try:
+        if tokenizer is None:
+            return sentence.split()
+        return tokenizer.morphs(sentence)
+    except Exception:
+        return sentence.split()
 
-            # 1) binary word2vec format
-            try:
-                self.word_vectors = KeyedVectors.load_word2vec_format(self.ko_bin_path, binary=True)
-                load_attempted = True
-            except Exception as e1:
-                print(f"binary load failed ({e1})")
 
-            # 2) text word2vec format
-            if not load_attempted:
-                try:
-                    self.word_vectors = KeyedVectors.load_word2vec_format(self.ko_bin_path, binary=False)
-                    load_attempted = True
-                except Exception as e2:
-                    print(f"text load failed ({e2})")
+def build_w2v(sentences_tokenized):
+    """
+    토큰화된 문장 리스트로 Word2Vec 학습
 
-            # 3) try latin1 encoding to avoid UnicodeDecodeError on weird headers
-            if not load_attempted:
-                try:
-                    self.word_vectors = KeyedVectors.load_word2vec_format(self.ko_bin_path, binary=False, encoding='latin1')
-                    load_attempted = True
-                except Exception as e3:
-                    print(f"text+latin1 load failed ({e3})")
+    Args:
+        sentences_tokenized: list of list of str
 
-            # 4) try gensim native loader (in case file is a saved KeyedVectors/Model)
-            if not load_attempted:
-                try:
-                    print("attempting KeyedVectors.load (gensim native format)...")
-                    self.word_vectors = KeyedVectors.load(self.ko_bin_path, mmap='r')
-                    load_attempted = True
-                except Exception as e4:
-                    print(f"KeyedVectors.load failed ({e4})")
+    Returns:
+        gensim Word2Vec 모델
+    """
+    print("Word2Vec 학습 중...")
+    model = Word2Vec(
+        sentences=sentences_tokenized,
+        vector_size=200,
+        window=5,
+        min_count=1,
+        sg=1,        # Skip-gram
+        epochs=20,
+        workers=4,
+    )
+    print(f"✓ Word2Vec 학습 완료 (vocab: {len(model.wv)})")
+    return model
 
-            # 5) try FastText facebook model loader
-            if not load_attempted:
-                try:
-                    from gensim.models.fasttext import load_facebook_model
-                    print("attempting FastText facebook model loader...")
-                    ft = load_facebook_model(self.ko_bin_path)
-                    self.word_vectors = ft.wv
-                    load_attempted = True
-                except Exception as ft_err:
-                    print(f"FastText load failed ({ft_err})")
 
-            # 6) final fallback: try load_word2vec_format with mmap
-            if not load_attempted:
-                try:
-                    print("final attempt: load_word2vec_format with mmap and binary heuristic...")
-                    self.word_vectors = KeyedVectors.load_word2vec_format(self.ko_bin_path, binary=True, unicode_errors='ignore')
-                    load_attempted = True
-                except Exception as final_err:
-                    print(f"final load attempt failed ({final_err})")
-                    raise final_err
+def lexical_sub(tokens, w2v_model, vocab, replace_prob=0.3):
+    """
+    각 토큰을 replace_prob 확률로 Word2Vec 유사어로 치환
 
-            print(f"✓ Model loaded successfully")
-            try:
-                print(f"Vocabulary size: {len(self.word_vectors)}")
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"✗ Error loading model: {e}")
-            # don't raise so caller can handle fallback
-            self.word_vectors = None
-    
-    def get_similar_words(self, word, topn=5):
-        """
-        단어와 유사한 단어들 가져오기
-        
-        Args:
-            word (str): 단어
-            topn (int): 반환할 유사 단어 개수
-            
-        Returns:
-            list: (유사단어, 유사도) 튜플 리스트
-        """
-        try:
-            if word in self.word_vectors:
-                return self.word_vectors.most_similar(word, topn=topn)
-            else:
-                return []
-        except Exception as e:
-            return []
-    
-    def augment_sentence(self, sentence, num_augmentations=1, replace_ratio=0.3):
-        """
-        문장 증강 (단어 대체를 통한 변형)
-        
-        Args:
-            sentence (str): 증강할 문장
-            num_augmentations (int): 생성할 증강 문장 개수
-            replace_ratio (float): 단어 변경 비율 (0.0~1.0)
-            
-        Returns:
-            list: 증강된 문장 리스트
-        """
-        augmented_sentences = []
-        words = sentence.split()
-        
-        if len(words) == 0:
-            return [sentence]  # 빈 문장은 그대로 반환
-        
-        for _ in range(num_augmentations):
-            augmented_words = words.copy()
-            
-            # 변경할 단어 개수 결정
-            num_replacements = max(1, int(len(words) * replace_ratio))
-            
-            # 랜덤하게 단어 선택
-            indices_to_replace = np.random.choice(
-                len(words), 
-                size=min(num_replacements, len(words)), 
-                replace=False
-            )
-            
-            for idx in indices_to_replace:
-                word = augmented_words[idx]
-                similar_words = self.get_similar_words(word, topn=3)
-                
-                if similar_words:
-                    # 유사 단어 선택 (유사도가 높은 것부터 선택하되, 일부 랜덤성 추가)
-                    chosen_word = similar_words[np.random.randint(0, len(similar_words))][0]
-                    augmented_words[idx] = chosen_word
-            
-            augmented_sentence = ' '.join(augmented_words)
-            if augmented_sentence != sentence:  # 원본과 다른 경우만 추가
-                augmented_sentences.append(augmented_sentence)
-        
-        return augmented_sentences if augmented_sentences else [sentence]
-    
-    def augment_dataset(self, df, augmentation_factor=3):
-        """
-        데이터셋 전체 증강
-        
-        Args:
-            df (pd.DataFrame): 원본 데이터
-            augmentation_factor (int): 증강 배수 (3배 증강 시 3)
-            
-        Returns:
-            pd.DataFrame: 증강된 데이터
-        """
-        # if model was not loaded, skip augmentation entirely
-        if self.word_vectors is None:
-            print("⚠️ word_vectors not available; skipping augmentation and returning original dataframe")
-            return df.copy()
+    Args:
+        tokens (list[str]): 형태소 리스트
+        w2v_model: 학습된 Word2Vec 모델
+        vocab (set): 유효 어휘 집합 (word2idx 키)
+        replace_prob (float): 치환 확률
 
-        augmented_data = []
-        
-        print(f"\nAugmenting dataset ({augmentation_factor}x)...")
-        
-        # 원본 데이터 추가
-        augmented_data = df.copy()
-        
-        # 증강 데이터 생성
-        augmentations_needed = (augmentation_factor - 1)  # 원본 1개 + 추가 생성
-        
-        for _ in range(augmentations_needed):
-            print(f"Creating augmentation {_ + 1}/{augmentations_needed}...")
-            aug_df = df.copy()
-            
-            aug_df['question'] = df['question'].apply(
-                lambda x: self.augment_sentence(x, num_augmentations=1, replace_ratio=0.2)[0]
-            )
-            aug_df['answer'] = df['answer'].apply(
-                lambda x: self.augment_sentence(x, num_augmentations=1, replace_ratio=0.2)[0]
-            )
-            
-            augmented_data = pd.concat([augmented_data, aug_df], ignore_index=True)
-        
-        # 중복 제거
-        augmented_data = augmented_data.drop_duplicates(
-            subset=['question', 'answer'], 
-            keep='first'
-        )
-        
-        print(f"✓ Dataset augmentation completed")
-        print(f"Original size: {len(df)}")
-        print(f"Augmented size: {len(augmented_data)}")
-        print(f"Increase: {len(augmented_data) / len(df):.2f}x")
-        
-        return augmented_data
+    Returns:
+        list[str]: 치환된 형태소 리스트
+    """
+    result = []
+    for token in tokens:
+        if np.random.random() < replace_prob and token in w2v_model.wv:
+            candidates = [
+                w for w, _ in w2v_model.wv.most_similar(token, topn=10)
+                if w in vocab and w != token
+            ]
+            result.append(candidates[0] if candidates else token)
+        else:
+            result.append(token)
+    return result
+
+
+def augment_sentence(sentence, tokenizer, w2v_model, vocab):
+    """문장 → 증강된 문장 (토큰화 → 치환 → 재결합)"""
+    tokens = tokenize(sentence, tokenizer)
+    aug_tokens = lexical_sub(tokens, w2v_model, vocab)
+    return " ".join(aug_tokens)
+
 
 def main():
-    """메인 실행 함수"""
     print("=" * 60)
-    print("Step 4: 데이터 증강 (Word2Vec 기반)")
+    print("Step 4: 코퍼스 기반 Word2Vec 증강")
     print("=" * 60)
-    
-    # 전처리된 데이터 로드
+
+    # 전처리 데이터 로드
     if not os.path.exists(config.CLEANED_CSV):
-        print(f"✗ Error: Processed data not found at {config.CLEANED_CSV}")
-        print("Please run 01_preprocess.py first")
+        print(f"✗ Error: {config.CLEANED_CSV} 없음. 01_preprocess.py를 먼저 실행하세요.")
         return
-    
-    print(f"\nLoading preprocessed data from {config.CLEANED_CSV}...")
+
+    print(f"\n데이터 로드: {config.CLEANED_CSV}")
     df = pd.read_csv(config.CLEANED_CSV)
-    print(f"✓ Loaded {len(df)} sentences")
-    
-    # 증강 사용 여부 체크
+    print(f"✓ {len(df)}개 문장 로드")
+
+    # 증강 스킵 옵션
     if not getattr(config, 'USE_AUGMENTATION', True):
-        print("⚠️ config.USE_AUGMENTATION이 False로 설정되어 있어 증강을 건너뜁니다.")
-        augmented_df = df.copy()
-    else:
-        # ko.bin 모델 확인
-        if not os.path.exists(config.KO_BIN_MODEL):
-            print(f"\n✗ Warning: ko.bin model not found at {config.KO_BIN_MODEL}")
-            print("\n모델 다운로드 방법:")
-            print("1. 다음 링크에서 ko.bin 다운로드:")
-            print("   https://github.com/Kyubyong/wordvectors")
-            print(f"2. {config.KO_BIN_MODEL}에 저장")
-            print("\n또는 다음 명령어 실행:")
-            print(f"mkdir -p {config.MODEL_PATH}")
-            print(f"wget https://dl.fbaipublicfiles.com/fasttext/vectors-crawl/cc.ko.300.bin.gz")
-            print(f"gunzip cc.ko.300.bin.gz -c > {config.KO_BIN_MODEL}")
-            
-            print("\n데이터 증강 없이 원본 데이터만 사용합니다.")
-            augmented_df = df.copy()
-        else:
-            # 데이터 증강
-            augmenter = DataAugmenter(config.KO_BIN_MODEL)
-            augmented_df = augmenter.augment_dataset(
-                df, 
-                augmentation_factor=config.AUGMENTATION_FACTOR
-            )
-    
+        print("⚠ USE_AUGMENTATION=False → 증강 없이 원본 저장")
+        os.makedirs(os.path.dirname(config.AUGMENTED_CSV), exist_ok=True)
+        df.to_csv(config.AUGMENTED_CSV, index=False, encoding='utf-8')
+        print(f"✓ {config.AUGMENTED_CSV} 저장 완료")
+        return
+
+    # 코퍼스(vocab) 로드
+    if not os.path.exists(config.CORPUS_PKL):
+        print(f"✗ Error: {config.CORPUS_PKL} 없음. 02_build_corpus.py를 먼저 실행하세요.")
+        return
+
+    with open(config.CORPUS_PKL, 'rb') as f:
+        corpus_data = pickle.load(f)
+    vocab = set(corpus_data['word2idx'].keys())
+    print(f"✓ 어휘 로드 완료 ({len(vocab)}개)")
+
+    # 토크나이저 초기화
+    tokenizer = get_tokenizer()
+
+    # 전체 문장 토큰화 (Word2Vec 학습용)
+    print("\n전체 문장 토큰화 중...")
+    all_tokenized = []
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        all_tokenized.append(tokenize(row['question'], tokenizer))
+        all_tokenized.append(tokenize(row['answer'], tokenizer))
+
+    # Word2Vec 학습
+    w2v_model = build_w2v(all_tokenized)
+
+    # 3배 증강
+    # - 원본
+    # - 증강본 1: 질문증강 + 원본답변
+    # - 증강본 2: 원본질문 + 답변증강
+    print("\n증강 데이터 생성 중...")
+
+    aug1_questions, aug1_answers = [], []
+    aug2_questions, aug2_answers = [], []
+
+    for _, row in tqdm(df.iterrows(), total=len(df)):
+        aug1_questions.append(augment_sentence(row['question'], tokenizer, w2v_model, vocab))
+        aug1_answers.append(row['answer'])
+
+        aug2_questions.append(row['question'])
+        aug2_answers.append(augment_sentence(row['answer'], tokenizer, w2v_model, vocab))
+
+    aug1_df = pd.DataFrame({'question': aug1_questions, 'answer': aug1_answers})
+    aug2_df = pd.DataFrame({'question': aug2_questions, 'answer': aug2_answers})
+
+    augmented_df = pd.concat([df, aug1_df, aug2_df], ignore_index=True)
+
+    print(f"\n원본 크기:  {len(df)}")
+    print(f"증강 후 크기: {len(augmented_df)}  ({len(augmented_df) / len(df):.1f}x)")
+
     # 샘플 확인
-    print("\n[샘플 데이터 (처음 3개)]")
-    print(augmented_df.head(3))
-    
-    # 통계
-    print("\n[데이터 통계]")
-    print(f"Question 평균 길이: {augmented_df['question'].str.len().mean():.2f}")
-    print(f"Answer 평균 길이: {augmented_df['answer'].str.len().mean():.2f}")
-    
-    # 増强된 데이터 저장
+    print("\n[샘플 — 원본 vs 증강]")
+    sample = df.iloc[0]
+    aug_q = augment_sentence(sample['question'], tokenizer, w2v_model, vocab)
+    aug_a = augment_sentence(sample['answer'], tokenizer, w2v_model, vocab)
+    print(f"  원본 질문: {sample['question']}")
+    print(f"  증강 질문: {aug_q}")
+    print(f"  원본 답변: {sample['answer']}")
+    print(f"  증강 답변: {aug_a}")
+
+    # 저장
     os.makedirs(os.path.dirname(config.AUGMENTED_CSV), exist_ok=True)
     augmented_df.to_csv(config.AUGMENTED_CSV, index=False, encoding='utf-8')
-    print(f"\n✓ Augmented data saved to {config.AUGMENTED_CSV}")
-    print(f"\n✓ Data augmentation completed successfully!")
+    print(f"\n✓ 증강 데이터 저장: {config.AUGMENTED_CSV}")
+    print("✓ 데이터 증강 완료!")
+
 
 if __name__ == "__main__":
     main()
