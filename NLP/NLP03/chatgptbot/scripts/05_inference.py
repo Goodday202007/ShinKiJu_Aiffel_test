@@ -15,8 +15,14 @@ model.load_state_dict(torch.load(config.MODEL_SAVE_PATH, map_location=device))
 model.to(device)
 model.eval()
 print(model)
+
+from konlpy.tag import Okt
+_okt = Okt()
+def okt_tokenize(text):
+    return _okt.morphs(text)
+
 def generate(prompt, max_new_tokens=30):
-    ids = [word2idx.get(t, 1) for t in prompt.split()]
+    ids = [word2idx.get(t, 1) for t in okt_tokenize(prompt)]
     x = torch.tensor([ids], dtype=torch.long).to(device)
     with torch.no_grad():
         for _ in range(max_new_tokens):
@@ -26,5 +32,12 @@ def generate(prompt, max_new_tokens=30):
             if idx2word.get(nt) in ["<end>", "<pad>"]: break
             x = torch.cat([x, torch.tensor([[nt]]).to(device)], dim=1)
     return " ".join([idx2word.get(i, "<unk>") for i in x[0].tolist()])
-for p in ["오늘 기분이", "밥 먹었어", "너무 힘들어"]:
-    print(f"입력: {p}\n출력: {generate(p)}\n")
+
+print("\n=== GPT 챗봇 대화 모드 (종료: q) ===")
+while True:
+    p = input("\n입력: ").strip()
+    if p.lower() == 'q':
+        break
+    if not p:
+        continue
+    print(f"출력: {generate(p)}")
