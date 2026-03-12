@@ -23,6 +23,34 @@ RewardModel = rm_module.RewardModel
 random.seed(cfg.RANDOM_SEED)
 torch.manual_seed(cfg.RANDOM_SEED)
 
+# ── 인터랙티브 하이퍼파라미터 설정 ────────────────────────────
+print("=" * 50)
+print("[PPO 하이퍼파라미터 설정]")
+print(f"  KL_COEF  : {cfg.PPO_KL_COEF}")
+print(f"  CLIP_EPS : {cfg.PPO_CLIP_EPS}")
+print(f"  LR       : {cfg.PPO_LR}")
+print(f"  BATCH    : {cfg.PPO_BATCH_SIZE}")
+print(f"  EPOCHS   : {cfg.PPO_EPOCHS}")
+print("=" * 50)
+
+kl = input(f"KL_COEF [{cfg.PPO_KL_COEF}] (그냥 엔터 = 현재값 유지): ").strip()
+if kl: cfg.PPO_KL_COEF = float(kl)
+
+clip = input(f"CLIP_EPS [{cfg.PPO_CLIP_EPS}] (그냥 엔터 = 현재값 유지): ").strip()
+if clip: cfg.PPO_CLIP_EPS = float(clip)
+
+lr = input(f"LR [{cfg.PPO_LR}] (그냥 엔터 = 현재값 유지): ").strip()
+if lr: cfg.PPO_LR = float(lr)
+
+print("\n[확인]")
+print(f"  KL_COEF  : {cfg.PPO_KL_COEF}")
+print(f"  CLIP_EPS : {cfg.PPO_CLIP_EPS}")
+print(f"  LR       : {cfg.PPO_LR}")
+confirm = input("이 설정으로 진행할까요? (y/n): ").strip().lower()
+if confirm != 'y':
+    print("취소됨.")
+    exit()
+
 
 # ── 1. PPO 프롬프트 데이터셋 ─────────────────────────────
 class PPODataset(Dataset):
